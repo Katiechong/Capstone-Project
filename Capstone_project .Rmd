@@ -1,0 +1,331 @@
+---
+title: "Springboard Capstone Project"
+author: "Katie Chong"
+date: "11/24/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE, 
+                      cache=TRUE, 
+                      fig.align='center', 
+                      message = F, 
+                      warning = F)
+indent1 = '    '
+indent2 = paste(rep(indent1, 2), collapse='')
+indent3 = paste(rep(indent1, 3), collapse='')
+
+doeval = TRUE
+doecho = FALSE
+devtools::session_info('rmarkdown')
+```
+
+```{r, message=FALSE, warning=FALSE, echo=FALSE}
+library(magrittr)
+library(dendextend)
+library(tidyverse)
+library(dplyr)
+library(randomForest)
+library(tree)
+library(maptree)
+library(class)
+library(lattice)
+library(ggridges)
+library(superheat)
+library(caTools)
+library(tm)
+library(SnowballC)
+library(jsonlite)
+library(ggplot2)
+library(rpart)
+library(rpart.plot)
+library(cluster)
+library(factoextra)
+library(plyr)
+library(reshape2)
+library(NbClust)
+library(caret)
+library(e1071)
+library(knitr)
+library(kableExtra)
+```
+
+# Background
+
+This dataset is from Kaggle: "What is cooking?" [link](https://www.kaggle.com/c/whats-cooking-kernels-only)
+
+We only use the training data set in this project, which contains recipes id, type of cuisine, and list of ingredients.
+We wish to analyze the common ingredients of different cuisines and make predictions based on what patterns we find. 
+
+**Importing Data**
+
+```{r}
+setwd("/Users/katiechong/Desktop/Capstone Project/Kaggle")
+train.cooking <- fromJSON("train.json", flatten = TRUE)
+```
+
+**Explore the data** 
+
+```{r}
+ggplot(train.cooking, aes(x = cuisine)) +
+    geom_histogram(stat = "count") +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+    ggtitle("Number of recipes in different cuisines")
+```
+As we can observe from the histogram, Italian has the most recipes in this dataset. Mexican and Southern U.S has a large amount of observations as well.  
+
+**Create Corpus**
+
+We use the **tm** package to create a *Corpus* that contains lists of ingredients within the training data. 
+The output shows that there are 39744 "documents", or in this case recipes, in the corpus. 
+
+```{r}
+ingredients <- Corpus(VectorSource(train.cooking$ingredients))
+# ingredients
+```
+
+**Preprocessing**
+
+We want to clean data first, and the common preprocessing procedures in **tm** package include: stemDocument, tolower, removePunctuation, removeWords, stopwords.
+
+For words that are very similar but not identical such as *thigh* and *thighs*, we want to get them into the same "stem" words. 
+For words that have uppercase letters, we want to convert all of them into lowercase. 
+
+```{r}
+# Remove all stem words
+ingredients <- tm_map(ingredients, stemDocument)
+
+# Convert all letters to lowercase
+ingredients <- tm_map(ingredients, tolower)
+```
+
+
+#Create Document Term Matrix (Bag of Ingredients)
+
+After preprocessing, a *Document Term Matrix* is created. The Term-Document Matrix is a matrix of words (or in this case, ingredients) in all of the recipes, and whether the ingredient appears in each recipe.
+
+```{r}
+ingredientsDTM <- DocumentTermMatrix(ingredients)
+# ingredientsDTM
+kable(inspect(ingredientsDTM[1000:1005,])) %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE) %>% scroll_box(width = "100%")
+```
+
+**Feature selection**
+
+The Term-Document Matrix contains a lot of columns (ingredients). Reducing the number of features, by removing ingredients that don't occur often, may help with the model (although sometimes unique ingredients may be key to predict certain cuisines).
+
+```{r}
+# We want to only keep terms(ingredients) that appear in 1% or more of the recipes. 
+sparse <- removeSparseTerms(ingredientsDTM, 0.99)
+# sparse
+```
+
+By selecting only ingredients that appear in at least 1% of the recipes, the number of ingredients in the Document Term Matrix was reduced from 2992 to 270, i.e.: only 9.02% of the full set of ingredients. The DTM is then converted to a data.frame for modelling.
+
+```{r}
+ingredients.df <- as.data.frame(as.matrix(sparse))
+# Make a copy for clustering later 
+ingredients.cluster <- ingredients.df
+# Add the dependent variable to the data.frame
+ingredients.df$cuisine <- as.factor(train.cooking$cuisine)
+```
+
+# K-means clustering
+
+Some of the cuisine have a lot of similar ingredients, hence the potential classification errors. We want to explore the similarties bewteen cuisines. Here we use k-means clustering.
+
+**Determined the best number of clusters using elbow method.**
+```{r}
+set.seed(123)
+# Compute and plot wss for k = 2 to k = 15
+max.k <- 20 # Maximal number of clusters
+min.k <- 5 # Minimal number of clusters
+
+wss <- sapply(min.k:max.k,
+         function(k){kmeans(ingredients.cluster, k, nstart=10)$tot.withinss})
+
+plot(min.k:max.k, wss,
+        type="b", pch = 19, frame = FALSE,
+        xlab="Number of clusters K",
+        ylab="Total within-clusters sum of squares")
+
+```
+Looks like there is a inflection point at around 6 clusters. 
+
+**k-means clustering via `kmeans()`**
+
+```{r}
+set.seed(123)
+ingredients.km = kmeans(ingredients.cluster, centers=6)
+# k-means cluster center 
+kable(ingredients.km$centers) %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE) %>% scroll_box(width = "100%")
+```
+
+# Split training/testing data set
+
+**To estimate the error of the model, the "train" dataset/bag of ingredients is separated into a training and validation set.**
+
+```{r}
+# Set random seed
+set.seed(1)
+
+# Sample 50% observations as training data 
+train = sample.split(ingredients.df, SplitRatio = 0.5)
+ingredients.train = ingredients.df[train,]
+# The rest as test data
+ingredients.test = ingredients.df[-train,]
+```
+
+**For later convenience purposes, we create `XTrain`, `YTrain`, `XTest` and `YTest`. `YTrain` and `YTest` are response vectors from the training set and the test set. `XTrain` and `XTest` are design matrices[^2].**
+    
+```{r XY}
+# YTrain is the true labels for cuisine on the training set, XTrain is the design matrix
+YTrain = ingredients.train$cuisine
+XTrain = ingredients.train %>% select(-cuisine)
+
+# YTest is the true labels for cuisine on the test set, Xtest is the design matrix
+YTest = ingredients.test$cuisine
+XTest = ingredients.test %>% select(-cuisine)
+```
+
+**We create an error rate function for later convience: it takes in the predicted values and the true values, return the average error rates**
+```{r}
+calc_error_rate = function(predicted.value, true.value){
+  return(mean(true.value!=predicted.value))
+}
+records = matrix(NA, nrow=3, ncol=2)
+colnames(records) = c("train.error","test.error")
+rownames(records) = c("CART","knn","random forest")
+```
+
+# Classification 
+
+**CART model**
+
+A basic model to create from the bag of ingredients is the CART model. This creates a decision tree based on some of the more important ingredients.
+The tree below shows the decision tree created from the training data.
+
+```{r}
+ingredients.cart <- rpart(cuisine ~ ., data = ingredients.train, method = "class")
+# Plot the tree
+prp(ingredients.cart)
+```
+
+**Evaluating CART model**
+
+We can then evaluate the model's accuracy and misclassfication rate using a confusion matrix.
+
+```{r, confusion_matrix}
+# Predict on test set
+cart.pred <- predict(ingredients.cart, newdata = ingredients.test, type = "class")
+# Obtain confusion matrix
+cart.CM <- table(cart.pred, YTest)
+# Test accuracy rate
+sum(diag(cart.CM))/sum(cart.CM)
+# Test error rate (Classification Error)
+1-sum(diag(cart.CM))/sum(cart.CM)
+```
+
+The accuracy of this model is only 41.7% whereas the misclassfication rate is at 58.2%.
+This prediction is poor and almost exclusively focus on Chinese, Indian, Italian, Mexican, Southern US and Thai.
+
+**We try to improve our CART model by using k-folds cross validation.** 
+```{r}
+# Use 10 folds cross validation to find the best number of complex parameters. 
+train.rpart <- train(cuisine ~ ., data = ingredients.train, method = "rpart", trControl = trainControl(method = "cv", number = 10), metric = "Accuracy")
+
+# Best value for complex parameters 
+train.rpart
+```
+
+
+- After determining the best value $cp$ for rpart, we train the `CART` classifier and compute the test error rate.
+```{r}
+# Set random seed to make the results reproducible
+set.seed(76)
+
+# Best cp used 
+ingredients.cart.cp <- rpart(cuisine ~ ., data = ingredients.train, method = "class", control = rpart.control(cp = 0.01108522))
+
+# Predict on training set
+cart.cp.train <- predict(ingredients.cart.cp, newdata = ingredients.train, type = "class")
+# Predict on test set
+cart.cp.test = predict(ingredients.cart.cp, newdata = ingredients.test, type = "class")
+
+# training error 
+CART_training_error <- 
+  calc_error_rate(cart.cp.train, YTrain)
+# testing error 
+CART_testing_error <- 
+  calc_error_rate(cart.cp.train, YTest)
+
+# pass in to records 
+records[1, 1] <- CART_training_error
+records[1, 2] <- CART_testing_error
+kable(records) %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE)
+```
+
+Obviously, there is no improve on our model. Therefore, we need to furthur analyze the dataset using some other machine learning techniques.
+
+**k-fold Cross-validation (k-fold CV)**
+
+```{r}
+# Use 10 folds cross validation to find the best number of neighbors. 
+train.kfold <- train(cuisine ~ ., data = ingredients.train, method = "knn", tuneGrid = expand.grid(k = 1:50), trControl = trainControl(method = "cv", number = 10), metric = "Accuracy")
+# Number of neighbors
+train.kfold
+```
+
+- After determining the best number $k$ for kNN, we train the `KNN` classifier and compute the test error rate.
+    
+```{r}
+# Set random seed to make the results reproducible
+set.seed(76)
+
+# Best k used 
+kfold.train = knn(train=XTrain, test=XTrain, cl=YTrain, k=10)
+kfold.test = knn(train=XTrain, test=XTest, cl=YTrain, k=10)
+
+# Confusion matrix for test data 
+kfold.CM = table(predicted=kfold.test, true=YTest)
+kfold.CM
+
+# training error 
+kfold_training_error <- 
+  calc_error_rate(kfold.train, YTrain)
+# testing error 
+kfold_testing_error <- 
+  calc_error_rate(kfold.test, YTest)
+
+# pass in to records 
+records[2, 1] <- kfold_training_error
+records[2, 2] <- kfold_testing_error
+kable(records) %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE) %>% scroll_box(width = "100%")
+```
+This is a big improvement from the CART model. The misclassfication rate for the test data set this time is at 37.25%.
+
+**Random forest**
+```{r}
+rf.ingredients <- randomForest(YTrain ~ ., data=ingredients.train, ntree=500, importance=TRUE)
+rf.ingredients
+plot(rf.ingredients)
+
+importance(rf.ingredients)
+varImpPlot(rf.ingredients, sort=T, main="Ingredients Importance for Predicting Cuisines", n.var=5)
+
+rf.train <- predict (rf.ingredients, newdata = ingredients.train)
+rf.test <- predict (rf.ingredients, newdata = ingredients.test)
+
+# training error 
+rf_training_error <- 
+  calc_error_rate(rf.train, YTrain)
+# testing error 
+rf_testing_error <- 
+  calc_error_rate(rf.test, YTest)
+
+# pass in to records 
+records[3, 1] <- rf_training_error
+records[3, 2] <- rf_testing_error
+kable(records) %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE) 
+```
+We see that most impartant factors are pepper, feta, milk, cilantro and soy, etc. This is somewhat consistent with what we have for CART model, although more specific. We have greatly improve our classification model by reducing the error rate of testing dataset to 2.4%. 
